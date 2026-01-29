@@ -1,0 +1,2471 @@
+==============================
+FILE: ./analyze_results.py
+==============================
+import os
+import glob
+import pandas as pd
+import re
+import numpy as np
+import time
+import sys
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- IMPORTS FOR RE-SIMULATION ---
+try:
+    import simulation
+    import creature
+    import genome
+    import pybullet as p
+    CAN_SIMULATE = True
+except ImportError:
+    print("\nCRITICAL WARNING: 'simulation.py' or 'creature.py' not found.")
+    print("Tables requiring Fitness/Height (Re-simulation) will fail or be empty.")
+    CAN_SIMULATE = False
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+root_dir = '.'  
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+def get_experiment_dirs(root):
+    """Finds all folders that contain 'test1', 'test2', and 'test3'."""
+    exp_dirs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if all(x in dirnames for x in ['test1', 'test2', 'test3']):
+            exp_dirs.append(dirpath)
+    return sorted(exp_dirs)
+
+def save_table_image(df, filename):
+    """Render a Pandas DataFrame as a clean PNG table with auto-fitting text."""
+    if df.empty:
+        return
+
+    # 1. Calculate required width based on text length
+    # We iterate through columns to find the longest string (header or cell)
+    total_chars = 0
+    for col in df.columns:
+        # Header length
+        header_len = len(str(col))
+        # Max cell length (convert to string first, handle empty logic)
+        if len(df) > 0:
+            cell_len = df[col].astype(str).map(len).max()
+        else:
+            cell_len = 0
+        total_chars += max(header_len, cell_len)
+
+    # Heuristic: 0.15 inches per character usually fits 12pt font well
+    # We add a buffer of 2 inches for margins
+    w = max(10, total_chars * 0.15 + 2)
+    h = max(3, (len(df) + 2) * 0.6) # 0.6 inches per row
+    
+    fig, ax = plt.subplots(figsize=(w, h))
+    ax.axis('off')  # Hide axes
+    
+    # 2. Create the table
+    # Round numbers to 3 decimals
+    tbl = ax.table(cellText=df.round(3).values, 
+                   colLabels=df.columns, 
+                   loc='center',
+                   cellLoc='center')
+    
+    # 3. Styling & Formatting
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(12)
+    tbl.scale(1, 2.0)  # Increase row height (vertical padding)
+    
+    # CRITICAL: Auto-adjust column widths to fit content
+    tbl.auto_set_column_width(col=list(range(len(df.columns))))
+    
+    # Add Title
+    title_text = filename.replace(".png", "").replace("_", " ")
+    plt.title(title_text, pad=20, fontsize=16, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"      Saved Image: '{filename}' (Size: {w:.1f}x{h:.1f})")
+
+def get_final_generation_stats(exp_path, sim_engine):
+    """
+    Loads the LAST generation elite from test1, test2, test3.
+    Re-simulates to get Fitness & Height.
+    Extracts Genes for Leg Count.
+    Returns the AVERAGE of the 3 tests.
+    """
+    stats = {
+        'fitness': [],
+        'height': [],
+        'leg_count': [],
+        'leg_length': []
+    }
+    
+    for test_folder in ['test1', 'test2', 'test3']:
+        full_test_path = os.path.join(exp_path, test_folder)
+        
+        # Find the highest generation file
+        csv_files = glob.glob(os.path.join(full_test_path, 'elite_*.csv'))
+        if not csv_files: continue
+        
+        # Sort to find the last one (e.g., elite_49.csv)
+        latest_file = max(csv_files, key=lambda f: int(re.search(r'elite_(\d+)\.csv', f).group(1)))
+        
+        try:
+            # 1. Load DNA
+            dna = genome.Genome.from_csv(latest_file)
+            
+            # 2. Extract Genes (Morphology)
+            # Gene 7 = Leg Count, Gene 0 = Leg Length
+            csv_data = pd.read_csv(latest_file, header=None)
+            gene7 = csv_data.iloc[0, 7]
+            gene0 = csv_data.iloc[0, 0]
+            
+            leg_count = int(4 + (gene7 * 8.99))
+            leg_length = 0.5 + (gene0 * 1.5)
+            
+            stats['leg_count'].append(leg_count)
+            stats['leg_length'].append(leg_length)
+
+            # 3. Re-Simulate (Performance)
+            if CAN_SIMULATE and sim_engine:
+                cr = creature.Creature(gene_count=1)
+                cr.update_dna(dna)
+                
+                # Run quick simulation (1000 steps)
+                sim_engine.run_creature(cr, iterations=1000)
+                
+                stats['fitness'].append(cr.get_distance_travelled())
+                stats['height'].append(getattr(cr, 'peak_z', 0))
+            else:
+                stats['fitness'].append(0)
+                stats['height'].append(0)
+                
+        except Exception as e:
+            print(f"Error processing {latest_file}: {e}")
+
+    # Return Averages
+    return {
+        'avg_fitness': np.mean(stats['fitness']) if stats['fitness'] else 0,
+        'avg_height': np.mean(stats['height']) if stats['height'] else 0,
+        'avg_legs': np.mean(stats['leg_count']) if stats['leg_count'] else 0,
+        'avg_length': np.mean(stats['leg_length']) if stats['leg_length'] else 0
+    }
+
+# ==========================================
+# MAIN MENU
+# ==========================================
+print("="*50)
+print("      EVOLUTIONARY ROBOTICS ANALYSIS TOOL")
+print("="*50)
+print("[1] Plot Single Metric (Graph over time)")
+print("[2] Generate Report Tables (Summary PNGs + CSVs)")
+choice = input("\nEnter choice (1 or 2): ").strip()
+
+# ==========================================
+# OPTION 2: GENERATE TABLES
+# ==========================================
+if choice == '2':
+    print("\n--- GENERATING TABLES ---")
+    if CAN_SIMULATE:
+        print("Initializing Physics Engine (Headless)...")
+        sim = simulation.Simulation(sim_id=0)
+    else:
+        sim = None
+
+    all_exps = get_experiment_dirs(root_dir)
+    data_rows = []
+
+    print(f"Processing {len(all_exps)} experiments (Calculating Final Stats)...")
+    
+    for exp in all_exps:
+        name = os.path.basename(exp)
+        print(f"  > Analyzing {name}...", end="")
+        stats = get_final_generation_stats(exp, sim)
+        print(" Done.")
+        
+        row = stats
+        row['Experiment'] = name
+        data_rows.append(row)
+
+    df = pd.DataFrame(data_rows)
+    
+    # --- TABLE 1: FITNESS VS HEIGHT (MISMATCH) ---
+    print("\n[1/3] Generating 'Mismatch Table' (Exp 1-3)...")
+    target_exps = ['Baseline', 'Experiment_2', 'Experiment_3'] 
+    t1_df = df[df['Experiment'].str.contains('|'.join(target_exps), case=False)].copy()
+    
+    if not t1_df.empty:
+        t1_cols = ['Experiment', 'avg_fitness', 'avg_height']
+        t1_df = t1_df[t1_cols]
+        t1_df.columns = ['Experiment', 'Avg Fitness Score', 'Avg Max Height (m)']
+        
+        base_name = "Table_1_Fitness_vs_Height_Mismatch"
+        t1_df.to_csv(f"{base_name}.csv", index=False)
+        save_table_image(t1_df, f"{base_name}.png")
+    else:
+        print("      Skipping Table 1 (No matching experiments found).")
+
+    # --- TABLE 2: MORPHOLOGY COMPARISON ---
+    print("\n[2/3] Generating 'Morphology Comparison'...")
+    # Compare Exp 1 (Worm) vs Exp 6 (Sphere) vs Exp 7 (Spider)
+    # Adjust filters as needed for your report logic
+    t2_df = df[['Experiment', 'avg_fitness', 'avg_height', 'avg_legs', 'avg_length']].copy()
+    t2_df.columns = ['Experiment', 'Fitness', 'Height (m)', 'Avg Leg Count', 'Avg Leg Length (m)']
+    
+    base_name_2 = "Table_2_Morphology_Comparison"
+    t2_df.to_csv(f"{base_name_2}.csv", index=False)
+    save_table_image(t2_df, f"{base_name_2}.png")
+
+    # --- TABLE 3: BLIND VS SENSORY (EXP 7 vs 8) ---
+    print("\n[3/3] Generating 'Blind vs Sensory'...")
+    target_exps_3 = ['Experiment_7', 'Experiment_8']
+    t3_df = df[df['Experiment'].str.contains('|'.join(target_exps_3), case=False)].copy()
+    
+    if not t3_df.empty:
+        t3_df = t3_df[['Experiment', 'avg_fitness', 'avg_height']]
+        t3_df.columns = ['Condition', 'Final Fitness', 'Final Height (m)']
+        
+        base_name_3 = "Table_3_Blind_vs_Sensory"
+        t3_df.to_csv(f"{base_name_3}.csv", index=False)
+        save_table_image(t3_df, f"{base_name_3}.png")
+    else:
+        print("      Skipping Table 3 (No matching experiments found).")
+
+    print("\n[DONE] All tables generated successfully.")
+    exit()
+
+# ==========================================
+# OPTION 1: ORIGINAL GRAPHING LOGIC
+# ==========================================
+COLUMN_NAMES = {
+    -1: ">> FITNESS SCORE (Re-Simulated)",
+    -2: ">> MAX HEIGHT (Re-Simulated)",
+    0: "Leg Length (Gene 0)",     
+    7: "Leg Count (Gene 7)",  
+    15: "Control Amp (Gene 15)",
+    16: "Control Freq (Gene 16)"
+}
+
+print(f"\nScanning '{root_dir}' for experiments...")
+all_experiments = get_experiment_dirs(root_dir)
+
+for i, exp in enumerate(all_experiments):
+    print(f"[{i+1}] {os.path.basename(exp)}")
+
+selection = input("\nEnter numbers to compare (e.g., '1 7 8') or ENTER for ALL: ").strip()
+selected_experiments = []
+if selection == "":
+    selected_experiments = all_experiments
+else:
+    try:
+        indices = [int(x) - 1 for x in selection.replace(',', ' ').split()]
+        for idx in indices:
+            if 0 <= idx < len(all_experiments):
+                selected_experiments.append(all_experiments[idx])
+    except:
+        selected_experiments = all_experiments
+
+print("\nSelect Metric to Graph:")
+for k, v in COLUMN_NAMES.items():
+    print(f"[{k:<2}] {v}")
+try:
+    col_idx = int(input("Choice: "))
+except:
+    col_idx = 0
+
+metric_name = COLUMN_NAMES.get(col_idx, f"Metric {col_idx}")
+print(f"\nProcessing {metric_name}...")
+
+if col_idx < 0 and CAN_SIMULATE:
+    sim = simulation.Simulation(sim_id=0)
+
+plot_data = []
+for exp_path in selected_experiments:
+    exp_name = os.path.basename(exp_path)
+    gen_data = {} 
+
+    print(f"  {exp_name}...", end="")
+    for test_folder in ['test1', 'test2', 'test3']:
+        full_test_path = os.path.join(exp_path, test_folder)
+        csv_files = glob.glob(os.path.join(full_test_path, 'elite_*.csv'))
+        
+        for f in csv_files:
+            try:
+                match = re.search(r'elite_(\d+)\.csv', f)
+                if not match: continue
+                gen = int(match.group(1))
+
+                if col_idx < 0:
+                    dna = genome.Genome.from_csv(f)
+                    cr = creature.Creature(gene_count=1)
+                    cr.update_dna(dna)
+                    sim.run_creature(cr, iterations=1000) 
+                    val = cr.get_distance_travelled() if col_idx == -1 else getattr(cr, 'peak_z', 0)
+                else:
+                    df_csv = pd.read_csv(f, header=None)
+                    raw_val = df_csv.iloc[0, col_idx]
+                    if col_idx == 0: val = 0.5 + (raw_val * 1.5)
+                    elif col_idx == 7: val = int(4 + (raw_val * 8.99))
+                    else: val = raw_val
+
+                if gen not in gen_data: gen_data[gen] = []
+                gen_data[gen].append(val)
+            except: pass
+    print(" Done.")
+
+    for gen, values in gen_data.items():
+        if values:
+            plot_data.append({'Experiment': exp_name, 'Generation': gen, 'Average Value': np.mean(values)})
+
+if plot_data:
+    df_plot = pd.DataFrame(plot_data)
+    plt.figure(figsize=(10, 6))
+    sns.lineplot(data=df_plot, x='Generation', y='Average Value', hue='Experiment', marker='o')
+    plt.title(f'Comparison: Average {metric_name}')
+    plt.ylabel(metric_name)
+    plt.grid(True, alpha=0.3)
+    clean_name = metric_name.replace(" ", "_").replace(">>", "").strip()
+    
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"Graph_{clean_name}_{timestamp}.png"
+    plt.savefig(filename)
+    print(f"\n[SUCCESS] Graph saved as '{filename}'")
+else:
+    print("No data found.")
+
+
+==============================
+FILE: ./creature.py
+==============================
+import genome 
+from xml.dom.minidom import getDOMImplementation
+from enum import Enum
+import numpy as np
+import math
+
+# --- CONFIGURATION ---
+# Set this to 'Basic' for your previous experiments
+# Set this to 'Spider' for Experiment 6
+EXP_MODE = 'Spider'
+
+
+class MotorType(Enum):
+    PULSE = 1
+    SINE = 2
+
+class Motor:
+    def __init__(self, control_waveform, control_amp, control_freq):
+        self.motor_type = MotorType.SINE
+        self.amp = control_amp
+        self.freq = control_freq
+        self.phase = 0
+    
+    def get_output(self):
+        self.phase = (self.phase + self.freq) % (np.pi * 2)
+        # CONTINUOUS WHEEL MODE: Always positive
+        return abs(self.amp)
+    
+
+
+class Creature:
+    def __init__(self, gene_count):
+        self.spec = genome.Genome.get_gene_spec()
+        self.dna = genome.Genome.get_random_genome(len(self.spec), gene_count)
+        self.flat_links = None
+        self.exp_links = None
+        self.motors = None
+        self.start_position = None
+        self.last_position = None
+
+    def get_flat_links(self):
+        if self.flat_links == None:
+            gdicts = genome.Genome.get_genome_dicts(self.dna, self.spec)
+            self.flat_links = genome.Genome.genome_to_links(gdicts)
+        return self.flat_links
+    
+    def get_expanded_links(self):
+        self.get_flat_links()
+        if self.exp_links is not None:
+            return self.exp_links
+        
+        exp_links = [self.flat_links[0]]
+        genome.Genome.expandLinks(self.flat_links[0], 
+                                self.flat_links[0].name, 
+                                self.flat_links, 
+                                exp_links)
+        self.exp_links = exp_links
+        return self.exp_links
+
+    def to_xml(self):
+        if EXP_MODE == 'Spider':
+            # Use the new Blueprint Generator
+            return genome.Genome.create_spider_xml(self.dna)
+        
+        else:
+            # --- OLD BASIC LOGIC ---
+            self.get_expanded_links()
+            domimpl = getDOMImplementation()
+            adom = domimpl.createDocument(None, "start", None)
+            robot_tag = adom.createElement("robot")
+            for link in self.exp_links:
+                robot_tag.appendChild(link.to_link_element(adom))
+            first = True
+            for link in self.exp_links:
+                if first:
+                    first = False
+                    continue
+                robot_tag.appendChild(link.to_joint_element(adom))
+            robot_tag.setAttribute("name", "pepe")
+            return '<?xml version="1.0"?>' + robot_tag.toprettyxml()
+
+    # In creature.py
+
+    def update_position(self, pos, orn=None):
+        # Update position
+        if self.start_position is None:
+            self.start_position = pos
+        self.last_position = pos
+        
+        # Save Orientation (The "Head" rotation)
+        if orn is not None:
+            self.last_orn = orn
+
+        # Update Heights
+        if not hasattr(self, 'peak_z'): self.peak_z = pos[2]
+        if not hasattr(self, 'verified_climb_z'): self.verified_climb_z = 0.0
+        
+        if pos[2] > self.peak_z: self.peak_z = pos[2]
+    
+    # This part of the code is done by me
+    def get_heading_error(self):
+        """
+        THE SENSOR: Returns the angle between the robot's nose and the mountain.
+        - Returns 0.0 if looking directly AT the mountain.
+        - Returns 3.14 (PI) if looking directly AWAY.
+        """
+        if self.last_position is None or not hasattr(self, 'last_orn'):
+            return 0.0 # Blind at start
+        
+        # 1. Where is the mountain? (At 0,0)
+        # Vector from robot to mountain = (0-x, 0-y)
+        dx = 0 - self.last_position[0]
+        dy = 0 - self.last_position[1]
+        target_angle = math.atan2(dy, dx)
+        
+        # 2. Where am I looking? (Yaw from Quaternion)
+        # PyBullet quaternions are [x, y, z, w]
+        x, y, z, w = self.last_orn
+        # Standard formula to convert Quaternion to Yaw (Rotation around Z)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        current_yaw = math.atan2(siny_cosp, cosy_cosp)
+        
+        # 3. Calculate Difference
+        diff = target_angle - current_yaw
+        
+        # Normalize to -PI to +PI
+        while diff > math.pi: diff -= 2*math.pi
+        while diff < -math.pi: diff += 2*math.pi
+        
+        return abs(diff)
+
+# This part of the code is done by me
+    def get_motors(self):
+        if self.motors == None:
+            motors = []
+            if EXP_MODE == 'Spider':
+                genes = self.dna[0]
+                if len(genes) < 10:
+                    genes = np.concatenate((genes, [0.5]*(10-len(genes))))
+
+                # --- SENSORY CONTROL LOGIC ---
+                heading_error = self.get_heading_error()
+                
+                # Threshold: Am I looking at the mountain?
+                # If error is small (< 0.5 radians), I see it!
+                can_see_target = heading_error < 0.5
+                
+                # --- MOTOR GENES ---
+                # We define TWO behaviors:
+                
+                # Behavior A: CHARGE (When seeing mountain)
+                run_speed = 6.0 + (genes[3] * 5.0)  # Fast
+                
+                # Behavior B: SEARCH (When lost)
+                # We turn one side backwards to rotate in place
+                turn_speed = 2.0 
+                
+                num_legs = int(4 + (genes[7] * 8.99))
+                
+                import math
+                for i in range(num_legs):
+                    # Default: Run Mode
+                    amp = run_speed * 1.0
+                    
+                    # SENSOR OVERRIDE:
+                    # If I can't see the mountain, switch to Turn Mode
+                    if not can_see_target:
+                        amp = turn_speed
+                        # Reverse left legs to spin in place
+                        angle = i * (2 * math.pi / num_legs) + (math.pi / num_legs)
+                        if (math.pi / 2) < angle < (3 * math.pi / 2):
+                            amp = -amp
+                            
+                    # Create Motor
+                    m = Motor(1, amp, 4.0) # Freq 4.0
+                    
+                    # Gait Phase
+                    if i % 2 == 0: m.phase = 0
+                    else: m.phase = np.pi
+                    
+                    motors.append(m)
+            
+            self.motors = motors 
+        return self.motors
+
+# In creature.py
+# This part of the code is done by me
+    def get_distance_travelled(self):
+        """
+        TUNED FITNESS FUNCTION
+        - Boosts 'Walking Reward' so Gen 0 learns to move.
+        - Adds 'Survival Bonus' to prevent 0.0 scores.
+        """
+        if self.start_position is None or self.last_position is None:
+            return 0.0
+        
+        # 1. Get Coordinates
+        start_x, start_y = self.start_position[0], self.start_position[1]
+        x, y = self.last_position[0], self.last_position[1]
+        z = getattr(self, 'peak_z', self.last_position[2])
+        
+        # 2. Calculate Distances
+        start_dist = math.sqrt(start_x**2 + start_y**2)
+        current_dist = math.sqrt(x**2 + y**2)
+        
+        # 3. SCORE CALCULATION
+        
+        # Part A: Walking Reward (AMPLIFIED)
+        # We multiply by 10 so 1 meter of walking = 10 points.
+        # This allows the GA to detect even small improvements in movement.
+        dist_improvement = (start_dist - current_dist) * 10.0
+        
+        # Part B: Height Bonus
+        # Only counts if they are actually off the floor (> 0.1)
+        height_score = 0
+        if z > 0.1:
+            height_score = z * 20.0  # Climbing is still double value!
+        
+        # 4. Final Sum with Survival Bonus
+        # We add 1.0 just for surviving. This prevents "0.0" scores, 
+        # allowing the GA to rank "bad walkers" higher than "dead robots".
+        total_score = dist_improvement + height_score + 1.0
+        
+        # Prevent negative scores if they run backwards
+        return max(0.1, total_score)
+    
+    def update_dna(self, dna):
+        self.dna = dna
+        self.flat_links = None
+        self.exp_links = None
+        self.motors = None
+        self.start_position = None
+        self.last_position = None
+
+
+==============================
+FILE: ./cw-envt.py
+==============================
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+import random
+import creature
+
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+import random
+import pybullet as p
+import math
+
+import pybullet as p
+
+
+
+def make_mountain(num_rocks=100, max_size=0.25, arena_size=10, mountain_height=5):
+    def gaussian(x, y, sigma=arena_size/4):
+        """Return the height of the mountain at position (x, y) using a Gaussian function."""
+        return mountain_height * math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+    for _ in range(num_rocks):
+        x = random.uniform(-1 * arena_size/2, arena_size/2)
+        y = random.uniform(-1 * arena_size/2, arena_size/2)
+        z = gaussian(x, y)  # Height determined by the Gaussian function
+
+        # Adjust the size of the rocks based on height. Higher rocks (closer to the peak) will be smaller.
+        size_factor = 1 - (z / mountain_height)
+        size = random.uniform(0.1, max_size) * size_factor
+
+        orientation = p.getQuaternionFromEuler([random.uniform(0, 3.14), random.uniform(0, 3.14), random.uniform(0, 3.14)])
+        rock_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[size, size, size])
+        rock_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[size, size, size], rgbaColor=[0.5, 0.5, 0.5, 1])
+        rock_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=rock_shape, baseVisualShapeIndex=rock_visual, basePosition=[x, y, z], baseOrientation=orientation)
+
+
+
+def make_rocks(num_rocks=100, max_size=0.25, arena_size=10):
+    for _ in range(num_rocks):
+        x = random.uniform(-1 * arena_size/2, arena_size/2)
+        y = random.uniform(-1 * arena_size/2, arena_size/2)
+        z = 0.5  # Adjust based on your needs
+        size = random.uniform(0.1,max_size)
+        orientation = p.getQuaternionFromEuler([random.uniform(0, 3.14), random.uniform(0, 3.14), random.uniform(0, 3.14)])
+        rock_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[size, size, size])
+        rock_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[size, size, size], rgbaColor=[0.5, 0.5, 0.5, 1])
+        rock_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=rock_shape, baseVisualShapeIndex=rock_visual, basePosition=[x, y, z], baseOrientation=orientation)
+
+
+def make_arena(arena_size=10, wall_height=1):
+    wall_thickness = 0.5
+    floor_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, arena_size/2, wall_thickness])
+    floor_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, arena_size/2, wall_thickness], rgbaColor=[1, 1, 0, 1])
+    floor_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=floor_collision_shape, baseVisualShapeIndex=floor_visual_shape, basePosition=[0, 0, -wall_thickness])
+
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, wall_thickness/2, wall_height/2])
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, wall_thickness/2, wall_height/2], rgbaColor=[0.7, 0.7, 0.7, 1])  # Gray walls
+
+    # Create four walls
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, arena_size/2, wall_height/2])
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, -arena_size/2, wall_height/2])
+
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness/2, arena_size/2, wall_height/2])
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness/2, arena_size/2, wall_height/2], rgbaColor=[0.7, 0.7, 0.7, 1])  # Gray walls
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[arena_size/2, 0, wall_height/2])
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[-arena_size/2, 0, wall_height/2])
+
+
+p.setGravity(0, 0, -10)
+
+arena_size = 20
+make_arena(arena_size=arena_size)
+
+#make_rocks(arena_size=arena_size)
+
+mountain_position = (0, 0, -1)  # Adjust as needed
+mountain_orientation = p.getQuaternionFromEuler((0, 0, 0))
+p.setAdditionalSearchPath('shapes/')
+# mountain = p.loadURDF("mountain.urdf", mountain_position, mountain_orientation, useFixedBase=1)
+# mountain = p.loadURDF("mountain_with_cubes.urdf", mountain_position, mountain_orientation, useFixedBase=1)
+
+mountain = p.loadURDF("gaussian_pyramid.urdf", mountain_position, mountain_orientation, useFixedBase=1)
+
+# generate a random creature
+cr = creature.Creature(gene_count=3)
+# save it to XML
+with open('test.urdf', 'w') as f:
+    f.write(cr.to_xml())
+# load it into the sim
+rob1 = p.loadURDF('test.urdf', (0, 0, 10))
+
+
+p.setRealTimeSimulation(1)
+
+
+
+
+==============================
+FILE: ./cw_envt_ga.py
+==============================
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+import random
+import math
+
+def make_arena(arena_size=10, wall_height=1, cid=0):
+    wall_thickness = 0.5
+    floor_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, arena_size/2, wall_thickness], physicsClientId=cid)
+    floor_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, arena_size/2, wall_thickness], rgbaColor=[1, 1, 0, 1], physicsClientId=cid)
+    floor_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=floor_collision_shape, baseVisualShapeIndex=floor_visual_shape, basePosition=[0, 0, -wall_thickness], physicsClientId=cid)
+
+    # --- ADD THIS BLOCK ---
+    # Increase Lateral Friction (Grip). Default is ~0.5. 
+    # Setting it to 2.0 or 4.0 makes it like rubber on tarmac.
+    p.changeDynamics(floor_body, -1, lateralFriction=4.0, physicsClientId=cid)
+
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, wall_thickness/2, wall_height/2], physicsClientId=cid)
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size/2, wall_thickness/2, wall_height/2], rgbaColor=[0.7, 0.7, 0.7, 1], physicsClientId=cid)
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, arena_size/2, wall_height/2], physicsClientId=cid)
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, -arena_size/2, wall_height/2], physicsClientId=cid)
+
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness/2, arena_size/2, wall_height/2], physicsClientId=cid)
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness/2, arena_size/2, wall_height/2], rgbaColor=[0.7, 0.7, 0.7, 1], physicsClientId=cid)
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[arena_size/2, 0, wall_height/2], physicsClientId=cid)
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[-arena_size/2, 0, wall_height/2], physicsClientId=cid)
+
+if __name__ == "__main__":
+    import creature 
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -10)
+    make_arena(arena_size=20)
+    p.setAdditionalSearchPath('shapes/')
+    p.loadURDF("gaussian_pyramid.urdf", (0,0,-1), useFixedBase=1)
+    
+    cr = creature.Creature(gene_count=3)
+    with open('test.urdf', 'w') as f:
+        f.write(cr.to_xml())
+    p.loadURDF('test.urdf', (0, 0, 10))
+    p.setRealTimeSimulation(1)
+    while True:
+        time.sleep(1/240)
+
+
+==============================
+FILE: ./genome.py
+==============================
+import numpy as np
+import copy 
+import random
+
+class Genome():
+    @staticmethod 
+    def get_random_gene(length):
+        gene = np.array([np.random.random() for i in range(length)])
+        return gene
+    
+    @staticmethod 
+    def get_random_genome(gene_length, gene_count):
+        genome = [Genome.get_random_gene(gene_length) for i in range(gene_count)]
+        return genome
+
+    @staticmethod
+    def get_gene_spec():
+        gene_spec =  {"link-shape":{"scale":1}, 
+            "link-length": {"scale":2},
+            "link-radius": {"scale":1},
+            "link-recurrence": {"scale":3},
+            "link-mass": {"scale":1},
+            "joint-type": {"scale":1},
+            "joint-parent":{"scale":1},
+            "joint-axis-xyz": {"scale":1},
+            "joint-origin-rpy-1":{"scale":np.pi * 2},
+            "joint-origin-rpy-2":{"scale":np.pi * 2},
+            "joint-origin-rpy-3":{"scale":np.pi * 2},
+            "joint-origin-xyz-1":{"scale":1},
+            "joint-origin-xyz-2":{"scale":1},
+            "joint-origin-xyz-3":{"scale":1},
+            "control-waveform":{"scale":1},
+            "control-amp":{"scale":0.25},
+            "control-freq":{"scale":1}
+            }
+        ind = 0
+        for key in gene_spec.keys():
+            gene_spec[key]["ind"] = ind
+            ind = ind + 1
+        return gene_spec
+    
+    @staticmethod
+    def get_gene_dict(gene, spec):
+        gdict = {}
+        for key in spec:
+            ind = spec[key]["ind"]
+            scale = spec[key]["scale"]
+            gdict[key] = gene[ind] * scale
+        return gdict
+
+    @staticmethod
+    def get_genome_dicts(genome, spec):
+        gdicts = []
+        for gene in genome:
+            gdicts.append(Genome.get_gene_dict(gene, spec))
+        return gdicts
+
+    @staticmethod
+    def expandLinks(parent_link, uniq_parent_name, flat_links, exp_links):
+        children = [l for l in flat_links if l.parent_name == parent_link.name]
+        sibling_ind = 1
+        for c in children:
+            for r in range(int(c.recur)):
+                sibling_ind  = sibling_ind +1
+                c_copy = copy.copy(c)
+                c_copy.parent_name = uniq_parent_name
+                uniq_name = c_copy.name + str(len(exp_links))
+                #print("exp: ", c.name, " -> ", uniq_name)
+                c_copy.name = uniq_name
+                c_copy.sibling_ind = sibling_ind
+                exp_links.append(c_copy)
+                assert c.parent_name != c.name, "Genome::expandLinks: link joined to itself: " + c.name + " joins " + c.parent_name 
+                Genome.expandLinks(c, uniq_name, flat_links, exp_links)
+
+    @staticmethod
+    def genome_to_links(gdicts):
+        links = []
+        link_ind = 0
+        parent_names = [str(link_ind)]
+        for gdict in gdicts:
+            link_name = str(link_ind)
+            parent_ind = gdict["joint-parent"] * len(parent_names)
+            assert parent_ind < len(parent_names), "genome.py: parent ind too high: " + str(parent_ind) + "got: " + str(parent_names)
+            parent_name = parent_names[int(parent_ind)]
+            #print("available parents: ", parent_names, "chose", parent_name)
+            recur = gdict["link-recurrence"]
+            link = URDFLink(name=link_name, 
+                            parent_name=parent_name, 
+                            recur=recur+1, 
+                            link_length=gdict["link-length"], 
+                            link_radius=gdict["link-radius"], 
+                            link_mass=gdict["link-mass"],
+                            joint_type=gdict["joint-type"],
+                            joint_parent=gdict["joint-parent"],
+                            joint_axis_xyz=gdict["joint-axis-xyz"],
+                            joint_origin_rpy_1=gdict["joint-origin-rpy-1"],
+                            joint_origin_rpy_2=gdict["joint-origin-rpy-2"],
+                            joint_origin_rpy_3=gdict["joint-origin-rpy-3"],
+                            joint_origin_xyz_1=gdict["joint-origin-xyz-1"],
+                            joint_origin_xyz_2=gdict["joint-origin-xyz-2"],
+                            joint_origin_xyz_3=gdict["joint-origin-xyz-3"],
+                            control_waveform=gdict["control-waveform"],
+                            control_amp=gdict["control-amp"],
+                            control_freq=gdict["control-freq"])
+            links.append(link)
+            if link_ind != 0:# don't re-add the first link
+                parent_names.append(link_name)
+            link_ind = link_ind + 1
+
+        # now just fix the first link so it links to nothing
+        links[0].parent_name = "None"
+        return links
+
+    @staticmethod
+    def crossover(g1, g2):
+        x1 = random.randint(0, len(g1)-1)
+        x2 = random.randint(0, len(g2)-1)
+        g3 = np.concatenate((g1[x1:], g2[x2:])) 
+        if len(g3) > len(g1):
+            g3 = g3[0:len(g1)] 
+        return g3
+
+    @staticmethod
+    def point_mutate(genome, rate, amount):
+        new_genome = copy.deepcopy(genome) # Use deepcopy to be safe
+        for gene in new_genome:
+            for i in range(len(gene)):
+                if random.random() < rate:
+                    # Randomly add OR subtract a small amount
+                    change = random.uniform(-amount, amount)
+                    gene[i] += change
+                
+                # Clamp between 0 and 1
+                if gene[i] >= 1.0:
+                    gene[i] = 0.9999
+                elif gene[i] < 0.0:
+                    gene[i] = 0.0
+        return new_genome
+
+    @staticmethod
+    def shrink_mutate(genome, rate):
+        if len(genome) == 1:
+            return copy.copy(genome)
+        if random.random() < rate:
+            ind = random.randint(0, len(genome)-1)
+            new_genome = np.delete(genome, ind, 0)
+            return new_genome
+        else:
+            return copy.copy(genome)
+
+    @staticmethod
+    def grow_mutate(genome, rate):
+        if random.random() < rate:
+            gene = Genome.get_random_gene(len(genome[0]))
+            new_genome = copy.copy(genome)
+            new_genome = np.append(new_genome, [gene], axis=0)
+            return new_genome
+        else:
+            return copy.copy(genome)
+
+
+    @staticmethod
+    def to_csv(dna, csv_file):
+        csv_str = ""
+        for gene in dna:
+            for val in gene:
+                csv_str = csv_str + str(val) + ","
+            csv_str = csv_str + '\n'
+
+        with open(csv_file, 'w') as f:
+            f.write(csv_str)
+
+    @staticmethod
+    def from_csv(filename):
+        csv_str = ''
+        with open(filename) as f:
+            csv_str = f.read()   
+        dna = []
+        lines = csv_str.split('\n')
+        for line in lines:
+            vals = line.split(',')
+            gene = [float(v) for v in vals if v != '']
+            if len(gene) > 0:
+                dna.append(gene)
+        return dna
+
+# This part of the code is done by me
+    @staticmethod
+    def create_spider_xml(dna):
+        # 1. Parse Genes
+        genes = dna[0]
+        if len(genes) < 10:
+            genes = np.concatenate((genes, [0.5]*(10-len(genes))))
+
+        # 2. Map Genes
+        leg_length = 0.5 + (genes[0] * 1.5)
+        leg_radius = 0.02 + (genes[1] * 0.08)
+        body_radius = 0.2 + (genes[2] * 0.4)
+        num_legs = int(4 + (genes[7] * 8.99))
+        
+        # 3. Build XML with Newlines (\n)
+        xml = '<?xml version="1.0"?>\n'
+        xml += '<robot name="spider">\n'
+        
+        # Chassis
+        xml += '  <link name="base_link">\n'
+        xml += f'    <visual><geometry><cylinder length="0.1" radius="{body_radius}"/></geometry><material name="blue"><color rgba="0 0 1 1"/></material></visual>\n'
+        xml += f'    <collision><geometry><cylinder length="0.1" radius="{body_radius}"/></geometry></collision>\n'
+        xml += '    <inertial><mass value="1.0"/><inertia ixx="0.1" iyy="0.1" izz="0.1" ixy="0" ixz="0" iyz="0"/></inertial>\n'
+        xml += '  </link>\n'
+
+        # Helper for Legs
+        def get_leg_str(id, color):
+            l = f'  <link name="leg_{id}">\n'
+            l += f'    <visual><geometry><cylinder length="{leg_length}" radius="{leg_radius}"/></geometry><material name="c_{id}"><color rgba="{color}"/></material></visual>\n'
+            l += f'    <collision><geometry><cylinder length="{leg_length}" radius="{leg_radius}"/></geometry></collision>\n'
+            l += '    <inertial><mass value="0.2"/><inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/></inertial>\n'
+            l += '    <contact><lateral_friction value="4.0"/></contact>\n'
+            l += '  </link>\n'
+            return l
+
+        # Helper for Joints
+        def get_joint_str(id, parent, child, x, y, z):
+            j = f'  <joint name="{id}" type="revolute">\n'
+            j += f'    <parent link="{parent}"/>\n'
+            j += f'    <child link="{child}"/>\n'
+            j += f'    <origin xyz="{x} {y} {z}" rpy="0 0 0"/>\n'
+            j += '    <axis xyz="1 0 0"/>\n'
+            j += '    <limit effort="2000" velocity="100.0" lower="-10000" upper="10000"/>\n'
+            j += '  </joint>\n'
+            return j
+
+        # 4. Attach Legs
+        import math
+        for i in range(num_legs):
+            angle = i * (2 * math.pi / num_legs) + (math.pi / num_legs)
+            x = (body_radius * 0.9) * math.cos(angle)
+            y = (body_radius * 0.9) * math.sin(angle)
+            color = "1 0 0 1" if i % 2 == 0 else "0 1 0 1"
+            
+            xml += get_leg_str(i, color)
+            xml += get_joint_str(f"base_to_leg{i}", "base_link", f"leg_{i}", x, y, 0)
+
+        xml += '</robot>\n'
+        return xml
+
+class URDFLink:
+    def __init__(self, name, parent_name, recur, 
+                link_length=0.1, 
+                link_radius=0.1, 
+                link_mass=0.1,
+                joint_type=0.1,
+                joint_parent=0.1,
+                joint_axis_xyz=0.1,
+                joint_origin_rpy_1=0.1,
+                joint_origin_rpy_2=0.1,
+                joint_origin_rpy_3=0.1,
+                joint_origin_xyz_1=0.1,
+                joint_origin_xyz_2=0.1,
+                joint_origin_xyz_3=0.1,
+                control_waveform=0.1,
+                control_amp=0.1,
+                control_freq=0.1):
+        self.name = name
+        self.parent_name = parent_name
+        self.recur = recur 
+        self.link_length=link_length 
+        self.link_radius=link_radius
+        self.link_mass=link_mass
+        self.joint_type=joint_type
+        self.joint_parent=joint_parent
+        self.joint_axis_xyz=joint_axis_xyz
+        self.joint_origin_rpy_1=joint_origin_rpy_1
+        self.joint_origin_rpy_2=joint_origin_rpy_2
+        self.joint_origin_rpy_3=joint_origin_rpy_3
+        self.joint_origin_xyz_1=joint_origin_xyz_1
+        self.joint_origin_xyz_2=joint_origin_xyz_2
+        self.joint_origin_xyz_3=joint_origin_xyz_3
+        self.control_waveform=control_waveform
+        self.control_amp=control_amp
+        self.control_freq=control_freq
+        self.sibling_ind = 1
+
+    def to_link_element(self, adom):
+        #         <link name="base_link">
+        #     <visual>
+        #       <geometry>
+        #         <cylinder length="0.6" radius="0.25"/>
+        #       </geometry>
+        #     </visual>
+        #     <collision>
+        #       <geometry>
+        #         <cylinder length="0.6" radius="0.25"/>
+        #       </geometry>
+        #     </collision>
+        #     <inertial>
+        # 	    <mass value="0.25"/>
+        # 	    <inertia ixx="0.0003" iyy="0.0003" izz="0.0003" ixy="0" ixz="0" iyz="0"/>
+        #     </inertial>
+        #   </link>
+  
+        link_tag = adom.createElement("link")
+        link_tag.setAttribute("name", self.name)
+        vis_tag = adom.createElement("visual")
+        geom_tag = adom.createElement("geometry")
+        cyl_tag = adom.createElement("cylinder")
+        cyl_tag.setAttribute("length", str(self.link_length))
+        cyl_tag.setAttribute("radius", str(self.link_radius))
+        
+        geom_tag.appendChild(cyl_tag)
+        vis_tag.appendChild(geom_tag)
+        
+        
+        coll_tag = adom.createElement("collision")
+        c_geom_tag = adom.createElement("geometry")
+        c_cyl_tag = adom.createElement("cylinder")
+        c_cyl_tag.setAttribute("length", str(self.link_length))
+        c_cyl_tag.setAttribute("radius", str(self.link_radius))
+        
+        c_geom_tag.appendChild(c_cyl_tag)
+        coll_tag.appendChild(c_geom_tag)
+        
+        #     <inertial>
+        # 	    <mass value="0.25"/>
+        # 	    <inertia ixx="0.0003" iyy="0.0003" izz="0.0003" ixy="0" ixz="0" iyz="0"/>
+        #     </inertial>
+        inertial_tag = adom.createElement("inertial")
+        mass_tag = adom.createElement("mass")
+        # pi r^2 * height
+        mass = np.pi * (self.link_radius * self.link_radius) * self.link_length
+        mass_tag.setAttribute("value", str(mass))
+        inertia_tag = adom.createElement("inertia")
+        # <inertia ixx="0.0003" iyy="0.0003" izz="0.0003" ixy="0" ixz="0" iyz="0"/>
+        inertia_tag.setAttribute("ixx", "0.03")
+        inertia_tag.setAttribute("iyy", "0.03")
+        inertia_tag.setAttribute("izz", "0.03")
+        inertia_tag.setAttribute("ixy", "0")
+        inertia_tag.setAttribute("ixz", "0")
+        inertia_tag.setAttribute("iyx", "0")
+        inertial_tag.appendChild(mass_tag)
+        inertial_tag.appendChild(inertia_tag)
+        
+
+        link_tag.appendChild(vis_tag)
+        link_tag.appendChild(coll_tag)
+        link_tag.appendChild(inertial_tag)
+        
+        return link_tag
+
+    def to_joint_element(self, adom):
+        #           <joint name="base_to_sub2" type="revolute">
+        #     <parent link="base_link"/>
+        #     <child link="sub_link2"/>
+        #     <axis xyz="1 0 0"/>
+        #     <limit effort="10" upper="0" lower="10" velocity="1"/>
+        #     <origin rpy="0 0 0" xyz="0 0.5 0"/>
+        #   </joint>
+        joint_tag = adom.createElement("joint")
+        joint_tag.setAttribute("name", self.name + "_to_" + self.parent_name)
+        if self.joint_type >= 0.5:
+            joint_tag.setAttribute("type", "revolute")
+        else:
+            joint_tag.setAttribute("type", "revolute")
+        parent_tag = adom.createElement("parent")
+        parent_tag.setAttribute("link", self.parent_name)
+        child_tag = adom.createElement("child")
+        child_tag.setAttribute("link", self.name)
+        axis_tag = adom.createElement("axis")
+        if self.joint_axis_xyz <= 0.33:
+            axis_tag.setAttribute("xyz", "1 0 0")
+        if self.joint_axis_xyz > 0.33 and self.joint_axis_xyz <= 0.66:
+            axis_tag.setAttribute("xyz", "0 1 0")
+        if self.joint_axis_xyz > 0.66:
+            axis_tag.setAttribute("xyz", "0 0 1")
+        
+        limit_tag = adom.createElement("limit")
+        # effort upper lower velocity
+        limit_tag.setAttribute("effort", "1")
+        limit_tag.setAttribute("upper", "-3.1415")
+        limit_tag.setAttribute("lower", "3.1415")
+        limit_tag.setAttribute("velocity", "1")
+        # <origin rpy="0 0 0" xyz="0 0.5 0"/>
+        orig_tag = adom.createElement("origin")
+        
+        rpy1 = self.joint_origin_rpy_1 * self.sibling_ind
+        rpy = str(rpy1) + " " + str(self.joint_origin_rpy_2) + " " + str(self.joint_origin_rpy_3)
+        
+        orig_tag.setAttribute("rpy", rpy)
+        xyz = str(self.joint_origin_xyz_1) + " " + str(self.joint_origin_xyz_2) + " " + str(self.joint_origin_xyz_3)
+        orig_tag.setAttribute("xyz", xyz)
+
+        joint_tag.appendChild(parent_tag)
+        joint_tag.appendChild(child_tag)
+        joint_tag.appendChild(axis_tag)
+        joint_tag.appendChild(limit_tag)
+        joint_tag.appendChild(orig_tag)
+        return joint_tag
+            
+
+
+
+
+
+
+==============================
+FILE: ./motor_test.py
+==============================
+import genome
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+
+## ... usual starter code to create a sim and floor
+p.connect(p.GUI)
+p.setPhysicsEngineParameter(enableFileCaching=0)
+p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+floor = p.createMultiBody(plane_shape, plane_shape)
+p.setGravity(0, 0, -10)
+# commenting out for mac compatibility
+#p.setRealTimeSimulation(1)
+
+# generate a random creature
+cr = creature.Creature(gene_count=3)
+# save it to XML
+with open('test.urdf', 'w') as f:
+    f.write(cr.to_xml())
+# load it into the sim
+rob1 = p.loadURDF('test.urdf')
+start_pos, orn = p.getBasePositionAndOrientation(rob1)
+
+# iterate 
+elapsed_time = 0
+wait_time = 1.0 / 240 # seconds
+total_time = 5 # seconds
+step = 0
+dist_moved = 0
+while True:
+    p.stepSimulation()
+    step += 1
+    if step % 120 == 0:
+        motors = cr.get_motors()
+        assert len(motors) == p.getNumJoints(rob1), "Something went wrong"
+        for jid in range(p.getNumJoints(rob1)):
+            mode = p.VELOCITY_CONTROL
+            vel = motors[jid].get_output()
+            p.setJointMotorControl2(rob1, 
+                        jid,  
+                        controlMode=mode, 
+                        targetVelocity=vel)
+        new_pos, orn = p.getBasePositionAndOrientation(rob1)
+        #print(new_pos)
+        dist_moved = np.linalg.norm(np.asarray(start_pos) - np.asarray(new_pos))
+    print(dist_moved)
+    time.sleep(wait_time)
+    elapsed_time += wait_time
+    if elapsed_time > total_time:
+        break
+
+print("TOTAL DISTANCE MOVED:", dist_moved)
+
+
+
+
+==============================
+FILE: ./offline_from_csv.py
+==============================
+import os 
+import genome
+import sys
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+
+## ... usual starter code to create a sim and floor
+def main(csv_file):
+    assert os.path.exists(csv_file), "Tried to load " + csv_file + " but it does not exists"
+
+    p.connect(p.DIRECT)
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+    plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+    floor = p.createMultiBody(plane_shape, plane_shape)
+    p.setGravity(0, 0, -10)
+#   p.setRealTimeSimulation(1)
+
+
+    # generate a random creature
+    cr = creature.Creature(gene_count=1)
+    dna = genome.Genome.from_csv(csv_file)
+    cr.update_dna(dna)
+    # save it to XML
+    with open('test.urdf', 'w') as f:
+        f.write(cr.to_xml())
+    # load it into the sim
+    rob1 = p.loadURDF('test.urdf')
+    # air drop it
+    p.resetBasePositionAndOrientation(rob1, [0, 0, 2.5], [0, 0, 0, 1])
+
+    start_pos, orn = p.getBasePositionAndOrientation(rob1)
+
+    # iterate 
+    elapsed_time = 0
+    wait_time = 1.0/240 # seconds
+    total_time = 30 # seconds
+    step = 0
+    while True:
+        p.stepSimulation()
+        step += 1
+        if step % 24 == 0:
+            motors = cr.get_motors()
+            assert len(motors) == p.getNumJoints(rob1), "Something went wrong"
+            for jid in range(p.getNumJoints(rob1)):
+                mode = p.VELOCITY_CONTROL
+                vel = motors[jid].get_output()
+                p.setJointMotorControl2(rob1, 
+                            jid,  
+                            controlMode=mode, 
+                            targetVelocity=vel)
+            new_pos, orn = p.getBasePositionAndOrientation(rob1)
+            #print(new_pos)
+            dist_moved = np.linalg.norm(np.asarray(start_pos) - np.asarray(new_pos))
+            print(dist_moved)
+        #time.sleep(wait_time)
+        elapsed_time += wait_time
+        if elapsed_time > total_time:
+            break
+
+    print("TOTAL DISTANCE MOVED:", dist_moved)
+
+
+
+if __name__ == "__main__":
+    assert len(sys.argv) == 2, "Usage: python playback_test.py csv_filename"
+    main(sys.argv[1])
+
+
+
+
+==============================
+FILE: ./population.py
+==============================
+import creature 
+import numpy as np
+
+class Population:
+    def __init__(self, pop_size, gene_count):
+        self.creatures = [creature.Creature(
+                          gene_count=gene_count) 
+                          for i in range(pop_size)]
+
+    @staticmethod
+    def get_fitness_map(fits):
+        fitmap = []
+        total = 0
+        for f in fits:
+            total = total + f
+            fitmap.append(total)
+        return fitmap
+    
+    @staticmethod
+    def select_parent(fitmap):
+        r = np.random.rand() # 0-1
+        r = r * fitmap[-1]
+        for i in range(len(fitmap)):
+            if r <= fitmap[i]:
+                return i
+
+
+
+
+==============================
+FILE: ./prepare_shapes.py
+==============================
+import random
+import math
+from noise import pnoise2
+
+# def write_to_obj(filename, vertices, indices):
+#     with open(filename, 'w') as f:
+#         # Write vertices to the file
+#         for vertex in vertices:
+#             f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+
+#         # Write faces to the file
+#         for face in indices:
+#             # OBJ indices start from 1, not 0
+#             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+def write_to_obj(filename, vertices, indices):
+    with open(filename, 'w') as f:
+        # Write vertices to the file
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+
+        # Write faces to the file
+        for face in indices:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+def make_pyramid(filename):
+    # Define the tetrahedron vertices and indices
+    vertices = [
+        [-5, -5, 0],  # Base vertex 1
+        [5, -5, 0],   # Base vertex 2
+        [0, 5, 0],    # Base vertex 3
+        [0, 0, 5]     # Apex vertex
+    ]
+    indices = [
+        [0, 1, 2],  # Base triangle
+        [0, 1, 3],  # Side triangle 1
+        [1, 2, 3],  # Side triangle 2
+        [2, 0, 3]   # Side triangle 3
+    ]
+    # Write the tetrahedron to an OBJ file
+    write_to_obj(filename, vertices, indices)
+
+
+def make_rocky_moutain(filename):
+
+    # Define the pyramid vertices and indices
+    vertices = [
+        [-5, -5, 0],  # Base vertex 1
+        [5, -5, 0],   # Base vertex 2
+        [5, 5, 0],    # Base vertex 3
+        [-5, 5, 0],   # Base vertex 4
+        [0, 0, 5]     # Apex vertex
+    ]
+    indices = [
+        [0, 1, 4],  # Side triangle 1
+        [1, 2, 4],  # Side triangle 2
+        [2, 3, 4],  # Side triangle 3
+        [3, 0, 4],  # Side triangle 4
+        [0, 1, 2],  # Base triangle 1
+        [2, 3, 0]   # Base triangle 2
+    ]
+
+    # Add random cubes embedded in the pyramid
+    num_cubes = 5
+    for _ in range(num_cubes):
+        size = random.uniform(0.5, 2)
+        x = random.uniform(-4, 4)
+        y = random.uniform(-4, 4)
+        z = random.uniform(0.5, 4.5)
+        
+        # Define cube vertices
+        cube_vertices = [
+            [x-size/2, y-size/2, z-size/2],
+            [x+size/2, y-size/2, z-size/2],
+            [x+size/2, y+size/2, z-size/2],
+            [x-size/2, y+size/2, z-size/2],
+            [x-size/2, y-size/2, z+size/2],
+            [x+size/2, y-size/2, z+size/2],
+            [x+size/2, y+size/2, z+size/2],
+            [x-size/2, y+size/2, z+size/2]
+        ]
+        
+        # Define cube faces
+        cube_indices = [
+            [0, 1, 2], [2, 3, 0],  # Bottom
+            [4, 5, 6], [6, 7, 4],  # Top
+            [0, 1, 5], [5, 4, 0],  # Front
+            [1, 2, 6], [6, 5, 1],  # Right
+            [2, 3, 7], [7, 6, 2],  # Back
+            [3, 0, 4], [4, 7, 3]   # Left
+        ]
+        
+        # Offset cube indices by the current number of vertices
+        offset = len(vertices)
+        cube_indices = [[i+offset for i in face] for face in cube_indices]
+        
+        # Add cube vertices and indices to the main lists
+        vertices.extend(cube_vertices)
+        indices.extend(cube_indices)
+
+    # Write the combined vertices and indices to an OBJ file
+    write_to_obj(filename, vertices, indices)
+
+
+
+def gaussian(x, y, sigma):
+    """Return the height of the shape at position (x, y) using a Gaussian function."""
+    return math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+def generate_gaussian_pyramid(filename, size=10, resolution=0.5, sigma=3):
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian(x, y, sigma)
+            vertices.append([x, y, z])
+
+    # Generate faces by connecting vertices
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            # Calculate indices for the current square
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            # Create two triangles for the current square
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+
+import math
+
+def gaussian2(x, y, sigma, height):
+    """Return the height of the shape at position (x, y) using a Gaussian function."""
+    return height * math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+def generate_gaussian_pyramid2(filename, size=10, resolution=0.5, sigma=3, height=5):
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function for the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian2(x, y, sigma, height)
+            vertices.append([x, y, z])
+
+    # Generate vertices for the flat base
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = 0
+            vertices.append([x, y, z])
+
+    # Generate faces by connecting vertices
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            # Calculate indices for the current square on the pyramid
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            # Create two triangles for the current square on the pyramid
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+            # Calculate indices for the current square on the base
+            base_offset = int(size / resolution) * int(size / resolution)
+            bottom_left_base = base_offset + bottom_left
+            bottom_right_base = base_offset + bottom_right
+            top_left_base = base_offset + top_left
+            top_right_base = base_offset + top_right
+
+            # Create two triangles for the current square on the base
+            faces.append([bottom_left_base, top_left_base, bottom_right_base])
+            faces.append([top_left_base, top_right_base, bottom_right_base])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+
+def generate_gaussian_pyramid3(filename, size=10, resolution=0.5, sigma=3, height=5, noise_scale=0.5, noise_factor=1.0):
+    """
+    pyramid with noise
+    """
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function for the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian2(x, y, sigma, height)
+
+            # Add Perlin noise to the z-coordinate
+            z += pnoise2(x * noise_scale, y * noise_scale) * noise_factor
+
+            vertices.append([x, y, z])
+
+ # Generate vertices for the flat base
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = 0
+            vertices.append([x, y, z])
+
+    # Generate faces by connecting vertices
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            # Calculate indices for the current square on the pyramid
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            # Create two triangles for the current square on the pyramid
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+            # Calculate indices for the current square on the base
+            base_offset = int(size / resolution) * int(size / resolution)
+            bottom_left_base = base_offset + bottom_left
+            bottom_right_base = base_offset + bottom_right
+            top_left_base = base_offset + top_left
+            top_right_base = base_offset + top_right
+
+            # Create two triangles for the current square on the base
+            faces.append([bottom_left_base, top_left_base, bottom_right_base])
+            faces.append([top_left_base, top_right_base, bottom_right_base])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+
+
+
+def generate_gaussian_pyramid4(filename, size=10, resolution=0.5, sigma=3, height=5, noise_scale=0.5, noise_factor=1.0):
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function for the top surface of the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian2(x, y, sigma, height)
+
+            # Add Perlin noise to the z-coordinate
+            z += pnoise2(x * noise_scale, y * noise_scale) * noise_factor
+
+            vertices.append([x, y, z])
+
+    # Generate vertices for the bottom surface (flat base) of the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = 0
+            vertices.append([x, y, z])
+
+    # Generate faces for the top surface
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+    # Generate faces for the bottom surface
+    base_offset = int(size / resolution) * int(size / resolution)
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            bottom_left_base = base_offset + i * int(size / resolution) + j
+            bottom_right_base = base_offset + i * int(size / resolution) + j + 1
+            top_left_base = base_offset + (i + 1) * int(size / resolution) + j
+            top_right_base = base_offset + (i + 1) * int(size / resolution) + j + 1
+
+            faces.append([bottom_left_base, top_left_base, bottom_right_base])
+            faces.append([top_left_base, top_right_base, bottom_right_base])
+
+    # Generate faces for the sides
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution)):
+            top = i * int(size / resolution) + j
+            bottom = base_offset + i * int(size / resolution) + j
+            top_next = (i + 1) * int(size / resolution) + j
+            bottom_next = base_offset + (i + 1) * int(size / resolution) + j
+
+            faces.append([top, bottom, top_next])
+            faces.append([top_next, bottom, bottom_next])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+# Generate the OBJ file
+generate_gaussian_pyramid4("./shapes/gaussian_pyramid.obj")
+
+
+# Generate the OBJ file
+# generate_gaussian_pyramid3("./shapes/gaussian_pyramid.obj")
+
+
+# Generate the OBJ file
+# generate_gaussian_pyramid("./shapes/gaussian_pyramid.obj")
+
+
+make_pyramid('./shapes/pyramid.obj')
+make_rocky_moutain('./shapes/mountain_with_cubes.obj')
+
+# make_pyramid('mountain.obj')
+# make_rocky_moutain('./shapes/mountain_with_cubes.obj')
+
+
+
+==============================
+FILE: ./realtime_from_csv.py
+==============================
+import os 
+import genome
+import sys
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+import cw_envt_ga as envt # Import your environment library
+import pybullet_data
+
+def main(csv_file):
+    assert os.path.exists(csv_file), "Tried to load " + csv_file + " but it does not exist"
+
+    # 1. Connect to GUI
+    cid = p.connect(p.GUI)
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+    p.setGravity(0, 0, -10)
+    
+    # Add search paths for basic shapes and your custom shapes
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setAdditionalSearchPath('shapes/')
+
+    # 2. Build the Arena & Mountain
+    # Pass the client ID (cid)
+    envt.make_arena(arena_size=20, cid=cid) 
+    
+    mountain_position = (0, 0, -1)
+    mountain_orientation = p.getQuaternionFromEuler((0, 0, 0))
+    # Load the Rocky Mountain with Cubes
+    p.loadURDF("shapes/gaussian_pyramid.urdf", mountain_position, mountain_orientation, useFixedBase=1)
+
+    # 3. Load the Genome
+    cr = creature.Creature(gene_count=1)
+    dna = genome.Genome.from_csv(csv_file)
+    cr.update_dna(dna)
+
+    # 4. Convert to XML and Load Robot
+    # We use a temp file for viewing
+    urdf_filename = 'view_temp.urdf'
+    with open(urdf_filename, 'w') as f:
+        f.write(cr.to_xml())
+    
+    # Spawn settings: Adjusted to drop near the mountain base or peak
+    # (4, 4, 1) is a good starting spot to climb UP.
+    rob1 = p.loadURDF(urdf_filename)
+    p.resetBasePositionAndOrientation(rob1, [4, 4, 1.0], [0, 0, 0, 1])
+
+    start_pos, orn = p.getBasePositionAndOrientation(rob1)
+
+   # 5. Run Simulation Loop
+    elapsed_time = 0
+    wait_time = 1.0/240 # seconds
+    total_time = 60 # Run for 60 seconds (adjust if needed)
+    step = 0
+    
+    print(f"Viewing {csv_file}... Press Ctrl+C to stop.")
+    
+    # CRITICAL FIX: Only run while the GUI window is open
+    while p.isConnected():
+        p.stepSimulation()
+        step += 1
+        
+        # --- UPDATE CREATURE STATE ---
+        # We get position/orientation EVERY STEP so the sensors work (Exp 8)
+        pos, orn = p.getBasePositionAndOrientation(rob1)
+        
+        # Try passing orientation (Exp 8 code), fallback to just position (Exp 7 code)
+        try:
+            cr.update_position(pos, orn)
+        except TypeError:
+            cr.update_position(pos)
+
+        # --- UPDATE MOTORS (10Hz) ---
+        if step % 24 == 0:
+            motors = cr.get_motors()
+            for jid in range(p.getNumJoints(rob1)):
+                mode = p.VELOCITY_CONTROL
+                vel = motors[jid].get_output()
+                p.setJointMotorControl2(rob1, 
+                            jid,  
+                            controlMode=mode, 
+                            targetVelocity=vel,
+                            force=180) # INCREASED TO 180 (Matches Simulation)
+            
+            # Print current height to terminal
+            print(f"Height: {round(pos[2], 2)}", end='\r')
+
+        time.sleep(wait_time)
+        elapsed_time += wait_time
+        if elapsed_time > total_time:
+            break
+
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        main(sys.argv[1])
+    else:
+        print("Usage: python realtime_from_csv.py <path_to_csv_file>")
+
+
+==============================
+FILE: ./simulation.py
+==============================
+import pybullet as p
+import cw_envt_ga as envt
+import pybullet_data
+from multiprocessing import Pool
+import os
+
+class Simulation: 
+    def __init__(self, sim_id=0):
+        self.physicsClientId = p.connect(p.DIRECT)
+        self.sim_id = sim_id
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self.sim_id)
+        p.setAdditionalSearchPath('shapes/', physicsClientId=self.sim_id)
+
+    def run_creature(self, cr, iterations=2400):
+        pid = self.physicsClientId
+        p.resetSimulation(physicsClientId=pid)
+        p.setPhysicsEngineParameter(enableFileCaching=0, physicsClientId=pid)
+        p.setGravity(0, 0, -10, physicsClientId=pid)
+
+        envt.make_arena(arena_size=20, cid=pid)
+        
+        # Load Mountain
+        mountain_pos = (0, 0, -1)
+        mountain_orn = p.getQuaternionFromEuler((0, 0, 0))
+        
+        # Make sure this filename is correct ("shapes/mountain_with_cubes.urdf")
+    def run_creature(self, cr, iterations=2400):
+        pid = self.physicsClientId
+        p.resetSimulation(physicsClientId=pid)
+        p.setPhysicsEngineParameter(enableFileCaching=0, physicsClientId=pid)
+        p.setGravity(0, 0, -10, physicsClientId=pid)
+
+        envt.make_arena(arena_size=20, cid=pid)
+        
+        # Load Mountain
+        mountain_pos = (0, 0, -1)
+        mountain_orn = p.getQuaternionFromEuler((0, 0, 0))
+        
+        # Make sure this filename is correct ("shapes/mountain_with_cubes.urdf")
+        self.mountain_id = p.loadURDF("shapes/gaussian_pyramid.urdf", mountain_pos, mountain_orn, useFixedBase=1, physicsClientId=pid)
+
+        # --- XML CREATION & SAVING ---
+        # CHECK INDENTATION HERE: This line must start at the same column as the line above
+        xml_file = 'temp' + str(self.sim_id) + '.urdf'
+        xml_str = cr.to_xml()
+        
+        # WRITE AND FLUSH
+        with open(xml_file, 'w') as f:
+            f.write(xml_str)
+            f.flush()
+            os.fsync(f.fileno()) 
+
+        # --- LOAD WITH ERROR CHECKING ---
+        try:
+            cid = p.loadURDF(xml_file, physicsClientId=pid)
+        except Exception as e:
+            print(f"\nFATAL ERROR LOADING URDF: {xml_file}")
+            print("--- XML CONTENT START ---")
+            print(xml_str)
+            print("--- XML CONTENT END ---")
+            raise e 
+
+        # Setup Physics
+        p.resetBasePositionAndOrientation(cid, [4, 4, 0.3], [0, 0, 0, 1], physicsClientId=pid)
+        for link_index in range(p.getNumJoints(cid, physicsClientId=pid)):
+            p.changeDynamics(cid, link_index, lateralFriction=5.0, spinningFriction=0.2, rollingFriction=0.2, physicsClientId=pid)
+        p.changeDynamics(cid, -1, lateralFriction=4.0, physicsClientId=pid)
+
+        # Initialize Stats
+        cr.start_position = [4, 4, 0.2] 
+        cr.last_position = [4, 4, 0.2]
+        cr.peak_z = 0.0
+        cr.verified_climb_z = 0.0
+        
+        # Simulation Loop
+        for step in range(iterations):
+            p.stepSimulation(physicsClientId=pid)
+            if step % 24 == 0:
+                self.update_motors(cid=cid, cr=cr)
+
+            pos, orn = p.getBasePositionAndOrientation(cid, physicsClientId=pid)
+            
+            # PASS BOTH TO CREATURE
+            cr.update_position(pos, orn)
+            
+            # Contact Check
+            contacts = p.getContactPoints(bodyA=cid, bodyB=self.mountain_id, physicsClientId=pid)
+            if len(contacts) > 0:
+                if pos[2] > cr.verified_climb_z:
+                    cr.verified_climb_z = pos[2]
+        # --- XML CREATION & SAVING ---
+        # CHECK INDENTATION HERE: This line must start at the same column as the line above
+        xml_file = 'temp' + str(self.sim_id) + '.urdf'
+        xml_str = cr.to_xml()
+        
+        # WRITE AND FLUSH
+        with open(xml_file, 'w') as f:
+            f.write(xml_str)
+            f.flush()
+            os.fsync(f.fileno()) 
+
+        # --- LOAD WITH ERROR CHECKING ---
+        try:
+            cid = p.loadURDF(xml_file, physicsClientId=pid)
+        except Exception as e:
+            print(f"\nFATAL ERROR LOADING URDF: {xml_file}")
+            print("--- XML CONTENT START ---")
+            print(xml_str)
+            print("--- XML CONTENT END ---")
+            raise e 
+
+        # Setup Physics
+        p.resetBasePositionAndOrientation(cid, [4, 4, 0.3], [0, 0, 0, 1], physicsClientId=pid)
+        for link_index in range(p.getNumJoints(cid, physicsClientId=pid)):
+            p.changeDynamics(cid, link_index, lateralFriction=5.0, spinningFriction=0.2, rollingFriction=0.2, physicsClientId=pid)
+        p.changeDynamics(cid, -1, lateralFriction=4.0, physicsClientId=pid)
+
+        # Initialize Stats
+        cr.start_position = [4, 4, 0.2] 
+        cr.last_position = [4, 4, 0.2]
+        cr.peak_z = 0.0
+        cr.verified_climb_z = 0.0
+        
+        # Simulation Loop
+        for step in range(iterations):
+            p.stepSimulation(physicsClientId=pid)
+            if step % 24 == 0:
+                self.update_motors(cid=cid, cr=cr)
+
+            pos, orn = p.getBasePositionAndOrientation(cid, physicsClientId=pid)
+            
+            # PASS BOTH TO CREATURE
+            cr.update_position(pos, orn)
+            
+            # Contact Check
+            contacts = p.getContactPoints(bodyA=cid, bodyB=self.mountain_id, physicsClientId=pid)
+            if len(contacts) > 0:
+                if pos[2] > cr.verified_climb_z:
+                    cr.verified_climb_z = pos[2]
+    
+    def update_motors(self, cid, cr):
+        for jid in range(p.getNumJoints(cid, physicsClientId=self.physicsClientId)):
+            m = cr.get_motors()[jid]
+            p.setJointMotorControl2(cid, jid, 
+                    controlMode=p.VELOCITY_CONTROL, 
+                    targetVelocity=m.get_output(), 
+                    force = 80,  # <--- CHANGE from 85 to 150 (More Torque)
+                    physicsClientId=self.physicsClientId)
+        
+
+    def eval_population(self, pop, iterations):
+        for cr in pop.creatures:
+            self.run_creature(cr, iterations) 
+
+
+class ThreadedSim():
+    def __init__(self, pool_size):
+        self.sims = [Simulation(i) for i in range(pool_size)]
+
+    # This part of the code is done by me
+    @staticmethod
+    def static_run_creature(sim, cr, iterations):
+        sim.run_creature(cr, iterations)
+        return cr
+    
+    def eval_population(self, pop, iterations):
+        pool_args = [] 
+        start_ind = 0
+        pool_size = len(self.sims)
+        while start_ind < len(pop.creatures):
+            this_pool_args = []
+            for i in range(start_ind, start_ind + pool_size):
+                if i == len(pop.creatures):
+                    break
+                sim_ind = i % len(self.sims)
+                this_pool_args.append([
+                            self.sims[sim_ind], 
+                            pop.creatures[i], 
+                            iterations]   
+                )
+            pool_args.append(this_pool_args)
+            start_ind = start_ind + pool_size
+
+        new_creatures = []
+        for pool_argset in pool_args:
+            with Pool(pool_size) as p:
+                creatures = p.starmap(ThreadedSim.static_run_creature, pool_argset)
+                new_creatures.extend(creatures)
+        pop.creatures = new_creatures
+
+
+
+
+
+==============================
+FILE: ./starter.py
+==============================
+import pybullet as p
+import pybullet_data as pd
+
+p.connect(p.GUI)
+p.setPhysicsEngineParameter(enableFileCaching=0)
+p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+floor = p.createMultiBody(plane_shape, plane_shape)
+p.setGravity(0, 0, -10)
+
+
+
+
+==============================
+FILE: ./test_creature.py
+==============================
+import unittest
+import creature
+import pybullet as p
+
+class TestCreature(unittest.TestCase):
+    def testCreatExists(self):
+        self.assertIsNotNone(creature.Creature)
+
+    def testCreatureGetFlatLinks(self):
+        c = creature.Creature(gene_count=4)
+        links = c.get_flat_links()
+        self.assertEqual(len(links), 4)
+
+    def testExpLinks(self):
+        c = creature.Creature(gene_count=25)
+        links = c.get_flat_links()
+        exp_links = c.get_expanded_links()
+        self.assertGreaterEqual(len(exp_links), len(links))
+
+    def testToXMLNotNone(self):
+        c = creature.Creature(gene_count=2)
+        xml_str = c.to_xml()
+        self.assertIsNotNone(xml_str)
+
+    def testLoadXML(self):
+        c = creature.Creature(gene_count=20)
+        xml_str = c.to_xml()
+        with open('test.urdf', 'w') as f:
+            f.write(xml_str)
+        p.connect(p.DIRECT)
+        cid = p.loadURDF('test.urdf')
+        self.assertIsNotNone(cid)
+
+      
+    def testMotor(self):
+        m = creature.Motor(0.1, 0.5, 0.5)
+        self.assertIsNotNone(m)
+
+    def testMotorVal(self):
+        m = creature.Motor(0.1, 0.5, 0.5)
+        self.assertEqual(m.get_output(), 1)
+
+    def testMotorVal2(self):
+        m = creature.Motor(0.6, 0.5, 0.5)
+        m.get_output()
+        m.get_output()     
+        self.assertGreater(m.get_output(), 0)
+    
+    def testDist(self):
+        c = creature.Creature(3)
+        c.update_position((0, 0, 0))
+        d1 = c.get_distance_travelled()
+        c.update_position((1, 1, 1))
+        d2 = c.get_distance_travelled()
+        self.assertGreater(d2, d1)
+        
+
+unittest.main()
+
+
+==============================
+FILE: ./test_ga.py
+==============================
+import unittest
+import population
+import simulation 
+import genome 
+import creature 
+import numpy as np
+import os
+
+# Some of this part of the code is done by me
+def run_ga(pop_size, gene_count, pool_size, iterations, generations):
+    # --- 1. SETUP RESULTS FOLDER ---
+    if not os.path.exists('results'): os.makedirs('results')
+    
+    existing = [d for d in os.listdir('results') if d.startswith('test')]
+    nums = [int(d.replace('test', '')) for d in existing if d.replace('test', '').isdigit()]
+    next_num = max(nums) + 1 if nums else 1
+    results_dir = os.path.join('results', f'test{next_num}')
+    os.makedirs(results_dir)
+    print(f"--- STARTING EXPERIMENT 7: FULL CO-EVOLUTION ---")
+    print(f"Saving results to: {results_dir}")
+
+    # --- 2. INITIALIZE POPULATION ---
+    pop = population.Population(pop_size=pop_size, gene_count=1)
+    sim = simulation.ThreadedSim(pool_size=pool_size) if pool_size > 1 else simulation.Simulation()
+
+    # --- 3. EVOLUTION LOOP ---
+    # We define 'gen' here in the loop header
+    for gen in range(generations): 
+        # A. Evaluate
+        sim.eval_population(pop, iterations)
+        
+        # B. Measure Fitness
+        fits = [c.get_distance_travelled() for c in pop.creatures]
+        max_fit = np.max(fits)
+        mean_fit = np.mean(fits)
+        
+        # C. Measure Height vs Verified Climb
+        # Check if attributes exist (safety check for first run)
+        heights = []
+        climbs = []
+        for c in pop.creatures:
+            # Use getattr to avoid crashes if variables aren't initialized
+            h = getattr(c, 'peak_z', 0.0) 
+            cl = getattr(c, 'verified_climb_z', 0.0)
+            heights.append(h)
+            climbs.append(cl)
+            
+        max_height = np.max(heights)
+        max_climb = np.max(climbs)
+        
+        # D. Print Stats (Now 'gen' is safely defined)
+        print(f"Gen {gen}: Fit: {max_fit:.2f} | Height: {max_height:.2f}m | Climbed: {max_climb:.2f}m")
+        
+        # E. Save Elite
+        best_idx = np.argmax(fits)
+        elite = pop.creatures[best_idx]
+        genome.Genome.to_csv(elite.dna, os.path.join(results_dir, f"elite_{gen}.csv"))
+        
+        # F. Reproduction
+        fit_map = population.Population.get_fitness_map(fits)
+        new_creatures = []
+        
+        for i in range(len(pop.creatures)):
+            p1 = pop.creatures[population.Population.select_parent(fit_map)]
+            p2 = pop.creatures[population.Population.select_parent(fit_map)]
+            dna = genome.Genome.crossover(p1.dna, p2.dna)
+            dna = genome.Genome.point_mutate(dna, rate=0.1, amount=0.25)
+            cr = creature.Creature(gene_count=1)
+            cr.update_dna(dna)
+            new_creatures.append(cr)
+        
+        new_creatures[0].update_dna(elite.dna) # Elitism
+        pop.creatures = new_creatures
+
+    print(f"Experiment Complete. Results saved in {results_dir}")
+    return max_fit, results_dir # Return values for the test assertion
+
+
+# This part of the code is done by me
+
+class TestGA(unittest.TestCase):
+    def testBasicGA(self):
+        print("--- STARTING EXPERIMENT 6: THE SPIDER (ADVANCED) ---")
+        print("Make sure EXP_MODE = 'Spider' is set in creature.py")
+        
+        # Standard Settings
+        fits, results_dir = run_ga(
+            pop_size=50,       # Standard population
+            gene_count=1,      # Standard complexity (3 limbs)
+            pool_size=1,       # Single thread
+            iterations=1000,   # 1000 steps = approx 4 seconds of climbing time
+            generations=50     # Run for 50 generations
+        )
+        
+        print(f"Spider Experiment Complete. Results saved in {results_dir}")
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+==============================
+FILE: ./test_ga_no_threads.py
+==============================
+# If you on a Windows machine with any Python version 
+# or an M1 mac with any Python version
+# or an Intel Mac with Python > 3.7
+# the multi-threaded version does not work
+# so instead, you can use this version. 
+
+import unittest
+import population
+import simulation 
+import genome 
+import creature 
+import numpy as np
+
+class TestGA(unittest.TestCase):
+    def testBasicGA(self):
+        pop = population.Population(pop_size=10, 
+                                    gene_count=3)
+        #sim = simulation.ThreadedSim(pool_size=1)
+        sim = simulation.Simulation()
+
+        for iteration in range(1000):
+            # this is a non-threaded version 
+            # where we just call run_creature instead
+            # of eval_population
+            for cr in pop.creatures:
+                sim.run_creature(cr, 2400)            
+            #sim.eval_population(pop, 2400)
+            fits = [cr.get_distance_travelled() 
+                    for cr in pop.creatures]
+            links = [len(cr.get_expanded_links()) 
+                    for cr in pop.creatures]
+            print(iteration, "fittest:", np.round(np.max(fits), 3), 
+                  "mean:", np.round(np.mean(fits), 3), "mean links", np.round(np.mean(links)), "max links", np.round(np.max(links)))       
+            fit_map = population.Population.get_fitness_map(fits)
+            new_creatures = []
+            for i in range(len(pop.creatures)):
+                p1_ind = population.Population.select_parent(fit_map)
+                p2_ind = population.Population.select_parent(fit_map)
+                p1 = pop.creatures[p1_ind]
+                p2 = pop.creatures[p2_ind]
+                # now we have the parents!
+                dna = genome.Genome.crossover(p1.dna, p2.dna)
+                dna = genome.Genome.point_mutate(dna, rate=0.1, amount=0.25)
+                dna = genome.Genome.shrink_mutate(dna, rate=0.25)
+                dna = genome.Genome.grow_mutate(dna, rate=0.1)
+                cr = creature.Creature(1)
+                cr.update_dna(dna)
+                new_creatures.append(cr)
+            # elitism
+            max_fit = np.max(fits)
+            for cr in pop.creatures:
+                if cr.get_distance_travelled() == max_fit:
+                    new_cr = creature.Creature(1)
+                    new_cr.update_dna(cr.dna)
+                    new_creatures[0] = new_cr
+                    filename = "elite_"+str(iteration)+".csv"
+                    genome.Genome.to_csv(cr.dna, filename)
+                    break
+            
+            pop.creatures = new_creatures
+                            
+        self.assertNotEqual(fits[0], 0)
+
+unittest.main()
+
+
+
+==============================
+FILE: ./test_genome.py
+==============================
+
+import unittest 
+import genome
+import numpy as np
+import os
+
+class GenomeTest (unittest.TestCase):
+    def testClassExists(self):
+        self.assertIsNotNone(genome.Genome)
+
+
+    def testClassExists(self):
+        self.assertIsNotNone(genome.Genome)
+
+    def testRandomGene(self):
+        self.assertIsNotNone(genome.Genome.get_random_gene)
+
+    def testRandomGeneNotNone(self):
+        self.assertIsNotNone(genome.Genome.get_random_gene(5))
+
+    def testRandomGeneHasValues(self):
+        gene = genome.Genome.get_random_gene(5)
+        self.assertIsNotNone(gene[0])
+
+    def testRandomGeneLength(self):
+        gene = genome.Genome.get_random_gene(20)
+        self.assertEqual(len(gene), 20)
+
+    def testRandGeneIsNumpyArrays(self):
+        gene = genome.Genome.get_random_gene(20)
+        self.assertEqual(type(gene), np.ndarray)
+
+    def testRandomGenomeExists(self):
+        data = genome.Genome.get_random_genome(20, 5)
+        self.assertIsNotNone(data)
+
+    def testGeneSpecExist(self):
+        spec = genome.Genome.get_gene_spec()
+        self.assertIsNotNone(spec)
+    
+    def testGeneSpecHasLinkLength(self):
+        spec = genome.Genome.get_gene_spec()
+        self.assertIsNotNone(spec['link-length'])
+
+    def testGeneSpecHasLinkLength(self):
+        spec = genome.Genome.get_gene_spec()
+        self.assertIsNotNone(spec['link-length']["ind"])
+
+    def testGeneSpecScale(self):
+        spec = genome.Genome.get_gene_spec()
+        gene = genome.Genome.get_random_gene(20)
+        self.assertGreater(gene[spec["link-length"]["ind"]], 0)
+
+
+    def testGeneToGeneDict(self):
+        spec = genome.Genome.get_gene_spec()
+        gene = genome.Genome.get_random_gene(len(spec))
+        gene_dict = genome.Genome.get_gene_dict(gene, spec)
+        self.assertIn("link-recurrence", gene_dict)
+
+    def testGenomeToDict(self):
+        spec = genome.Genome.get_gene_spec()
+        dna = genome.Genome.get_random_genome(len(spec), 3)
+        genome_dicts = genome.Genome.get_genome_dicts(dna, spec)
+        self.assertEqual(len(genome_dicts), 3)
+
+    def testFlatLinks(self):
+        links = [
+          genome.URDFLink(name="A", parent_name=None, recur=1), 
+          genome.URDFLink(name="B", parent_name="A", recur=2), 
+          genome.URDFLink(name="C", parent_name="B", recur=2)
+        ]
+        self.assertIsNotNone(links)
+
+    def testExpandLinks(self):
+        links = [
+            genome.URDFLink(name="A", parent_name="None", recur=1), 
+            genome.URDFLink(name="B", parent_name="A", recur=1), 
+            genome.URDFLink(name="C", parent_name="B", recur=2), 
+            genome.URDFLink(name="D", parent_name="C", recur=1), 
+        ]
+        exp_links = [links[0]]
+        genome.Genome.expandLinks(links[0], links[0].name, links, exp_links)   
+        self.assertEqual(len(exp_links), 6)
+
+    def testCrossover(self):
+        g1 = [[1], [2], [3]]
+        g2 = [[4], [5], [6]]
+        for i in range(10):
+            g3 = genome.Genome.crossover(g1, g2)
+            self.assertGreater(len(g3), 0)
+    
+    def test_point(self):
+        g1 = np.array([[1.0], [2.0], [3.0]])
+        g2 = genome.Genome.point_mutate(g1, rate=1, amount=0.25)
+        self.assertFalse(np.array_equal(g1, g2))
+    
+    def test_point_range(self):
+        g1 = np.array([[1.0], [0.0], [1.0], [0.0]])
+        for i in range(100):
+            g2 = genome.Genome.point_mutate(g1, rate=1, amount=0.25)
+            self.assertLessEqual(np.max(g2), 1.0)
+            self.assertGreaterEqual(np.min(g2), 0.0)
+    
+    def test_shrink(self):
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.shrink_mutate(g1, rate=1.0)
+        # should def. shrink as rate = 1
+        self.assertEqual(len(g2), 1) 
+
+    def test_shrink2(self):
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.shrink_mutate(g1, rate=0.0)
+        # should not shrink as rate = 0
+        self.assertEqual(len(g2), 2) 
+
+    def test_shrink3(self):
+        g1 = np.array([[1.0]])
+        g2 = genome.Genome.shrink_mutate(g1, rate=1.0)
+        # should not shrink if already len 1
+        self.assertEqual(len(g2), 1) 
+    
+    def test_grow1(self):
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.grow_mutate(g1, rate=1)
+        self.assertGreater(len(g2), len(g1))
+
+    def test_grow2(self):
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.grow_mutate(g1, rate=0)
+        self.assertEqual(len(g2), len(g1))
+
+    def test_tocsv(self):
+        g1 = [[1,2,3]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        self.assertTrue(os.path.exists('test.csv'))
+
+    def test_tocsv_content(self):
+        g1 = [[1,2,3]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        expect = "1,2,3,\n"
+        with open('test.csv') as f:
+            csv_str = f.read() 
+        self.assertEqual(csv_str, expect)
+
+    def test_tocsv_content2(self):
+        g1 = [[1,2,3], [4,5,6]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        expect = "1,2,3,\n4,5,6,\n"
+        with open('test.csv') as f:
+            csv_str = f.read() 
+        self.assertEqual(csv_str, expect)
+
+    def test_from_csv(self):
+        g1 = [[1,2,3]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        g2 = genome.Genome.from_csv('test.csv')
+        print(g1, g2)
+        self.assertTrue(np.array_equal(g1, g2))
+
+    def test_from_csv2(self):
+        g1 = [[1,2,3], [4,5,6]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        g2 = genome.Genome.from_csv('test.csv')
+        print(g1, g2)
+        self.assertTrue(np.array_equal(g1, g2))
+
+unittest.main()
+
+
+
+==============================
+FILE: ./test_population.py
+==============================
+import unittest
+import population 
+import numpy as np
+
+class TestPop(unittest.TestCase):
+    ## check for a parent id in the range 0-2
+    def testSelPar(self):
+        fits = [2.5, 1.2, 3.4]
+        fitmap = population.Population.get_fitness_map(fits)
+        pid = population.Population.select_parent(fitmap)
+        self.assertLess(pid, 3)
+
+    ## parent id should be 1 as the first fitness is zero
+    ## second is 1000 and third is 0.1 , so second should 
+    ## almost always be selected
+    def testSelPar2(self):
+        fits = [0, 1000, 0.1]
+        fitmap = population.Population.get_fitness_map(fits)
+        pid = population.Population.select_parent(fitmap)
+        self.assertEqual(pid, 1)    
+
+unittest.main()
+
+
+==============================
+FILE: ./test_simulation.py
+==============================
+import unittest
+import simulation
+import creature
+import population
+
+class TestSim(unittest.TestCase):
+    def testSimExists(self):
+        sim = simulation.Simulation()
+        self.assertIsNotNone(sim)
+
+    def testSimId(self):
+        sim = simulation.Simulation()
+        self.assertIsNotNone(sim.physicsClientId)
+
+    def testRun(self):
+        sim = simulation.Simulation()
+        self.assertIsNotNone(sim.run_creature)
+
+    def testPos(self):
+        sim = simulation.Simulation()
+        cr = creature.Creature(gene_count = 3)
+        sim.run_creature(cr)
+        self.assertNotEqual(cr.start_position, cr.last_position)
+    
+    def testPop(self):
+        pop = population.Population(pop_size=5, gene_count=3)
+        sim = simulation.Simulation()
+        for cr in pop.creatures:
+            sim.run_creature(cr)
+        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+        print(dists)
+        self.assertIsNotNone(dists)
+
+## uncomment this to test the 
+## multi-threaded sim
+#    def testProc(self):
+#        pop = population.Population(pop_size=20, gene_count=3)
+#        tsim = simulation.ThreadedSim(pool_size=8)
+#        tsim.eval_population(pop, 2400)
+#        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+#        print(dists)
+#        self.assertIsNotNone(dists)
+
+    def testProcNoThread(self):
+        pop = population.Population(pop_size=20, gene_count=3)
+        sim = simulation.Simulation()
+        sim.eval_population(pop, 2400)
+        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+        print(dists)
+        self.assertIsNotNone(dists)
+
+unittest.main()
+
+
+
